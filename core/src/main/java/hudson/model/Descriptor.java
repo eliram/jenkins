@@ -28,8 +28,8 @@ import hudson.PluginWrapper;
 import hudson.RelativePath;
 import hudson.XmlFile;
 import hudson.BulkChange;
+import hudson.ExtensionList;
 import hudson.Util;
-import hudson.init.Initializer;
 import hudson.model.listeners.SaveableListener;
 import hudson.util.FormApply;
 import hudson.util.FormValidation.CheckMethod;
@@ -63,7 +63,6 @@ import java.util.HashMap;
 import java.util.Locale;
 import java.util.Arrays;
 import java.util.Collections;
-import java.util.Stack;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.logging.Level;
 import java.util.logging.Logger;
@@ -367,6 +366,7 @@ public abstract class Descriptor<T extends Describable<T>> implements Saveable {
      * @deprecated since 1.528
      *      Use {@link #getCheckMethod(String)}
      */
+    @Deprecated
     public String getCheckUrl(String fieldName) {
         return getCheckMethod(fieldName).toCheckUrl();
     }
@@ -513,6 +513,7 @@ public abstract class Descriptor<T extends Describable<T>> implements Saveable {
      *      Implement {@link #newInstance(StaplerRequest, JSONObject)} method instead.
      *      Deprecated as of 1.145. 
      */
+    @Deprecated
     public T newInstance(StaplerRequest req) throws FormException {
         throw new UnsupportedOperationException(getClass()+" should implement newInstance(StaplerRequest,JSONObject)");
     }
@@ -685,6 +686,7 @@ public abstract class Descriptor<T extends Describable<T>> implements Saveable {
      * @deprecated
      *      As of 1.239, use {@link #configure(StaplerRequest, JSONObject)}.
      */
+    @Deprecated
     public boolean configure( StaplerRequest req ) throws FormException {
         return true;
     }
@@ -910,10 +912,35 @@ public abstract class Descriptor<T extends Describable<T>> implements Saveable {
         if (formData!=null) {
             for (Object o : JSONArray.fromObject(formData)) {
                 JSONObject jo = (JSONObject)o;
-                String kind = jo.getString("kind");
-                Descriptor<T> d = find(descriptors, kind);
+                Descriptor<T> d = null;
+                // 'kind' and '$class' are mutually exclusive (see class-entry.jelly), but to be more lenient on the reader side,
+                // we check them both anyway. 'kind' (which maps to ID) is more unique than '$class', which can have multiple matching
+                // Descriptors, so we prefer 'kind' if it's present.
+                String kind = jo.optString("kind", null);
+                if (kind != null) {
+                    // Only applies when Descriptor.getId is overridden.
+                    // Note that kind is only supported here,
+                    // *not* inside the StaplerRequest.bindJSON which is normally called by newInstance
+                    // (since Descriptor.newInstance is not itself available to Stapler).
+                    // If you merely override getId for some reason, but use @DataBoundConstructor on your Describable,
+                    // there is no problem; but you can only rely on newInstance being called at top level.
+                    d = findById(descriptors, kind);
+                }
+                if (d == null) {
+                  kind = jo.optString("$class");
+                  if (kind != null) { // else we will fall through to the warning
+                      // This is the normal case.
+                      d = findByDescribableClassName(descriptors, kind);
+                      if (d == null) {
+                          // Deprecated system where stapler-class was the Descriptor class name (rather than Describable class name).
+                          d = findByClassName(descriptors, kind);
+                      }
+                  }
+                }
                 if (d != null) {
                     items.add(d.newInstance(req, jo));
+                } else {
+                    LOGGER.log(Level.WARNING, "Received unexpected form data element: {0}", jo);
                 }
             }
         }
@@ -922,24 +949,60 @@ public abstract class Descriptor<T extends Describable<T>> implements Saveable {
     }
 
     /**
-     * Finds a descriptor from a collection by its class name.
+     * Finds a descriptor from a collection by its ID.
+     * @param id should match {@link #getId}
+     * @since 1.610
      */
-    public static @CheckForNull <T extends Descriptor> T find(Collection<? extends T> list, String className) {
+    public static @CheckForNull <T extends Descriptor> T findById(Collection<? extends T> list, String id) {
         for (T d : list) {
-            if(d.getClass().getName().equals(className))
-                return d;
-        }
-        // Since we introduced Descriptor.getId(), it is a preferred method of identifying descriptor by a string.
-        // To make that migration easier without breaking compatibility, let's also match up with the id.
-        for (T d : list) {
-            if(d.getId().equals(className))
+            if(d.getId().equals(id))
                 return d;
         }
         return null;
     }
 
+    /**
+     * Finds a descriptor from a collection by the class name of the {@link Descriptor}.
+     * This is useless as of the introduction of {@link #getId} and so only very old compatibility code needs it.
+     */
+    private static @CheckForNull <T extends Descriptor> T findByClassName(Collection<? extends T> list, String className) {
+        for (T d : list) {
+            if(d.getClass().getName().equals(className))
+                return d;
+        }
+        return null;
+    }
+
+    /**
+     * Finds a descriptor from a collection by the class name of the {@link Describable} it describes.
+     * @param className should match {@link Class#getName} of a {@link #clazz}
+     * @since 1.610
+     */
+    public static @CheckForNull <T extends Descriptor> T findByDescribableClassName(Collection<? extends T> list, String className) {
+        for (T d : list) {
+            if(d.clazz.getName().equals(className))
+                return d;
+        }
+        return null;
+    }
+
+    /**
+     * Finds a descriptor from a collection by its class name or ID.
+     * @deprecated choose between {@link #findById} or {@link #findByDescribableClassName}
+     */
+    public static @CheckForNull <T extends Descriptor> T find(Collection<? extends T> list, String string) {
+        T d = findByClassName(list, string);
+        if (d != null) {
+                return d;
+        }
+        return findById(list, string);
+    }
+
+    /**
+     * @deprecated choose between {@link #findById} or {@link #findByDescribableClassName}
+     */
     public static @CheckForNull Descriptor find(String className) {
-        return find(Jenkins.getInstance().getExtensionList(Descriptor.class),className);
+        return find(ExtensionList.lookup(Descriptor.class),className);
     }
 
     public static final class FormException extends Exception implements HttpResponse {
@@ -969,7 +1032,7 @@ public abstract class Descriptor<T extends Describable<T>> implements Saveable {
 
         public void generateResponse(StaplerRequest req, StaplerResponse rsp, Object node) throws IOException, ServletException {
             if (FormApply.isApply(req)) {
-                FormApply.applyResponse("notificationBar.show(" + quote(getMessage())+ ",notificationBar.defaultOptions.ERROR)")
+                FormApply.applyResponse("notificationBar.show(" + quote(getMessage())+ ",notificationBar.ERROR)")
                         .generateResponse(req, rsp, node);
             } else {
                 // for now, we can't really use the field name that caused the problem.
@@ -987,77 +1050,4 @@ public abstract class Descriptor<T extends Describable<T>> implements Saveable {
     public static final class Self {}
 
     protected static Class self() { return Self.class; }
-
-    /**
-     * Register a global {@link BindInterceptor} that uses {@link Descriptor#newInstance(StaplerRequest, JSONObject)}
-     * for instantiation
-     */
-    @Initializer
-    public static void initGlobalBindInterceptor() {
-        boolean newInstance = WebApp.get(Jenkins.getInstance().servletContext).bindInterceptors.add(new BindInterceptor() {
-            final class Input {
-                final Class type;
-                final JSONObject json;
-
-                private Input(Class type, JSONObject json) {
-                    this.type = type;
-                    this.json = json;
-                }
-
-                @Override
-                public boolean equals(Object o) {
-                    if (this == o) return true;
-                    if (o == null || getClass() != o.getClass()) return false;
-
-                    Input rhs = (Input) o;
-                    return json==rhs.json && type==rhs.type;
-
-                }
-
-                @Override
-                public int hashCode() {
-                    return 31*type.hashCode() + json.hashCode();
-                }
-            }
-
-            private final ThreadLocal<Stack<Input>> inputs = new ThreadLocal<Stack<Input>>() {
-                protected Stack<Input> initialValue() {
-                    return new Stack<Input>();
-                }
-            };
-
-            @Override
-            public Object instantiate(Class actualType, JSONObject json) {
-                if (Describable.class.isAssignableFrom(actualType)) {
-                    Descriptor d = Jenkins.getInstance().getDescriptor(actualType);
-                    if (d != null) {
-                        try {
-                            // only when Descriptor.newInstance is overridden
-                            Method m = d.getClass().getMethod("newInstance", StaplerRequest.class, JSONObject.class);
-                            if (m.getDeclaringClass() != Descriptor.class) {
-                                Input newFrame = new Input(actualType,json);
-                                if (!inputs.get().contains(newFrame)) {
-                                    // prevent infinite recursion in case Descriptor.newInstance calls right back into
-                                    // bindJSON
-                                    inputs.get().push(newFrame);
-                                    try {
-                                        StaplerRequest req = Stapler.getCurrentRequest();
-                                        if (req != null)
-                                            return d.newInstance(req, json);
-                                    } finally {
-                                        inputs.get().pop();
-                                    }
-                                }
-                            }
-                        } catch (NoSuchMethodException e) {
-                            throw new AssertionError(e);    // this can't happen because Descriptor defines such a method
-                        } catch (FormException e) {
-                            throw new IllegalArgumentException(e);
-                        }
-                    }
-                }
-                return DEFAULT;
-            }
-        });
-    }
 }

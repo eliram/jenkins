@@ -41,6 +41,7 @@ import java.util.List;
 import com.thoughtworks.xstream.annotations.XStreamSerializable;
 import com.thoughtworks.xstream.converters.UnmarshallingContext;
 import javax.annotation.CheckForNull;
+import javax.annotation.Nonnull;
 import jenkins.model.Jenkins;
 
 /**
@@ -89,6 +90,7 @@ public abstract class ToolInstallation extends AbstractDescribableImpl<ToolInsta
      * @deprecated
      *      as of 1.302. Use {@link #ToolInstallation(String, String, List)} 
      */
+    @Deprecated
     public ToolInstallation(String name, String home) {
         this.name = name;
         this.home = home;
@@ -163,7 +165,7 @@ public abstract class ToolInstallation extends AbstractDescribableImpl<ToolInsta
      * @see EnvironmentSpecific
      * @since 1.460
      */
-    public ToolInstallation translate(Node node, EnvVars envs, TaskListener listener) throws IOException, InterruptedException {
+    public ToolInstallation translate(@Nonnull Node node, EnvVars envs, TaskListener listener) throws IOException, InterruptedException {
         ToolInstallation t = this;
         if (t instanceof NodeSpecific) {
             NodeSpecific n = (NodeSpecific) t;
@@ -213,6 +215,10 @@ public abstract class ToolInstallation extends AbstractDescribableImpl<ToolInsta
         for (ToolProperty<?> p : properties)
             _setTool(p, this);
         return this;
+    }
+
+    @Override public String toString() {
+        return getClass().getSimpleName() + "[" + name + "]";
     }
 
     /**

@@ -70,6 +70,7 @@ public final class CronTab {
      * @deprecated as of 1.448
      *      Use {@link #CronTab(String, int, Hash)}
      */
+    @Deprecated
     public CronTab(String format, int line) throws ANTLRException {
         set(format, line, null);
     }
@@ -428,6 +429,16 @@ public final class CronTab {
                     break OUTER;
                 }
             }
+        }
+
+        int daysOfMonth = 0;
+        for (int i = 1; i < 31; i++) {
+            if (checkBits(bits[2], i)) {
+                daysOfMonth++;
+            }
+        }
+        if (daysOfMonth > 5 && daysOfMonth < 28) { // a bit arbitrary
+            return Messages.CronTab_short_cycles_in_the_day_of_month_field_w();
         }
 
         String hashified = hashify(spec);

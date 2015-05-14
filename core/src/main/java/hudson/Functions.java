@@ -28,7 +28,7 @@ package hudson;
 import hudson.cli.CLICommand;
 import hudson.console.ConsoleAnnotationDescriptor;
 import hudson.console.ConsoleAnnotatorFactory;
-import hudson.matrix.MatrixProject;
+import hudson.init.InitMilestone;
 import hudson.model.AbstractProject;
 import hudson.model.Action;
 import hudson.model.Describable;
@@ -44,9 +44,9 @@ import hudson.model.JobPropertyDescriptor;
 import hudson.model.ModelObject;
 import hudson.model.Node;
 import hudson.model.PageDecorator;
+import hudson.model.PaneStatusProperties;
 import hudson.model.ParameterDefinition;
 import hudson.model.ParameterDefinition.ParameterDescriptor;
-import hudson.model.Project;
 import hudson.model.Run;
 import hudson.model.TopLevelItem;
 import hudson.model.User;
@@ -140,7 +140,7 @@ import org.apache.commons.jelly.XMLOutput;
 import org.apache.commons.jexl.parser.ASTSizeFunction;
 import org.apache.commons.jexl.util.Introspector;
 import org.apache.commons.lang.StringUtils;
-import org.codehaus.mojo.animal_sniffer.IgnoreJRERequirement;
+import org.jenkins.ui.icon.IconSet;
 import org.jvnet.tiger_types.Types;
 import org.kohsuke.stapler.Ancestor;
 import org.kohsuke.stapler.Stapler;
@@ -150,9 +150,10 @@ import org.kohsuke.stapler.jelly.InternationalizedStringExpression.RawHtmlArgume
 
 import com.google.common.base.Predicate;
 import com.google.common.base.Predicates;
+import hudson.util.RunList;
 import java.util.concurrent.atomic.AtomicLong;
 import org.kohsuke.accmod.Restricted;
-import org.kohsuke.accmod.restrictions.DoNotUse;
+import org.kohsuke.accmod.restrictions.NoExternalUse;
 
 /**
  * Utility functions used in views.
@@ -189,11 +190,9 @@ public class Functions {
         return o instanceof ModelObjectWithChildren;
     }
     
-    /**
-     * @since 1.524
-     */
+    @Deprecated
     public static boolean isMatrixProject(Object o) {
-        return o instanceof MatrixProject;
+        return o != null && o.getClass().getName().equals("hudson.matrix.MatrixProject");
     }
 
     public static String xsDate(Calendar cal) {
@@ -203,9 +202,28 @@ public class Functions {
     public static String rfc822Date(Calendar cal) {
         return Util.RFC822_DATETIME_FORMATTER.format(cal.getTime());
     }
-    
+
+    /**
+     * During Jenkins start-up, before {@link InitMilestone#PLUGINS_STARTED} the extensions lists will be empty
+     * and they are not guaranteed to be fully populated until after {@link InitMilestone#EXTENSIONS_AUGMENTED}.
+     * If you attempt to access the extensions list from a UI thread while the extensions are being loaded you will
+     * hit a big honking great monitor lock that will block until the effective extension list has been determined
+     * (as if a plugin fails to start, all of the failed plugin's extensions and any dependent plugins' extensions
+     * will have to be evicted from the list of extensions. In practical terms this only affects the
+     * "Jenkins is loading" screen, but as that screen uses the generic layouts we provide this utility method
+     * so that the generic layouts can avoid iterating extension lists while Jenkins is starting up.
+     *
+     * @return {@code true} if the extensions lists have been populated.
+     * @since 1.607
+     */
+    public static boolean isExtensionsAvailable() {
+        final Jenkins jenkins = Jenkins.getInstance();
+        return jenkins != null && jenkins.getInitLevel().compareTo(InitMilestone.EXTENSIONS_AUGMENTED) >= 0;
+    }
+
     public static void initPageVariables(JellyContext context) {
-        String rootURL = Stapler.getCurrentRequest().getContextPath();
+        StaplerRequest currentRequest = Stapler.getCurrentRequest();
+        String rootURL = currentRequest.getContextPath();
 
         Functions h = new Functions();
         context.setVariable("h", h);
@@ -225,6 +243,9 @@ public class Functions {
          */
         context.setVariable("resURL",rootURL+getResourcePath());
         context.setVariable("imagesURL",rootURL+getResourcePath()+"/images");
+
+        context.setVariable("userAgent", currentRequest.getHeader("User-Agent"));
+        IconSet.initPageVariables(context);
     }
 
     /**
@@ -257,7 +278,7 @@ public class Functions {
      * like "-5", "+/-0", "+3".
      */
     public static String getDiffString(int i) {
-        if(i==0)    return "\u00B10";   // +/-0
+        if(i==0)    return "±0";
         String s = Integer.toString(i);
         if(i>0)     return "+"+s;
         else        return s;
@@ -408,7 +429,7 @@ public class Functions {
         return Node.Mode.values();
     }
 
-    public static String getProjectListString(List<Project> projects) {
+    public static String getProjectListString(List<AbstractProject> projects) {
         return Items.toNameList(projects);
     }
 
@@ -417,6 +438,7 @@ public class Functions {
      *      JEXL now supports the real ternary operator "x?y:z", so this work around
      *      is no longer necessary.
      */
+    @Deprecated
     public static Object ifThenElse(boolean cond, Object thenValue, Object elseValue) {
         return cond ? thenValue : elseValue;
     }
@@ -445,13 +467,14 @@ public class Functions {
         return formatter.format(r);
     }
 
-    @Restricted(DoNotUse.class)
+    @Restricted(NoExternalUse.class)
     public static String[] printLogRecordHtml(LogRecord r, LogRecord prior) {
         String[] oldParts = prior == null ? new String[4] : logRecordPreformat(prior);
         String[] newParts = logRecordPreformat(r);
         for (int i = 0; i < /* not 4 */3; i++) {
             newParts[i] = "<span class='" + (newParts[i].equals(oldParts[i]) ? "logrecord-metadata-old" : "logrecord-metadata-new") + "'>" + newParts[i] + "</span>";
         }
+        newParts[3] = Util.xmlEscape(newParts[3]);
         return newParts;
     }
     /**
@@ -508,6 +531,15 @@ public class Functions {
         return c.getValue();
     }
 
+    private static final Pattern ICON_SIZE = Pattern.compile("\\d+x\\d+");
+    @Restricted(NoExternalUse.class)
+    public static String validateIconSize(String iconSize) throws SecurityException {
+        if (!ICON_SIZE.matcher(iconSize).matches()) {
+            throw new SecurityException("invalid iconSize");
+        }
+        return iconSize;
+    }
+
     /**
      * Gets the suffix to use for YUI JavaScript.
      */
@@ -531,6 +563,20 @@ public class Functions {
             return map.tailMap(Integer.parseInt(to));
 
         return map.subMap(Integer.parseInt(to),Integer.parseInt(from)-1);
+    }
+
+    /**
+     * Creates a sub map by using the given range (upper end inclusive).
+     */
+    @Restricted(NoExternalUse.class)
+    public static <V> SortedMap<Integer,V> filterExcludingFrom(SortedMap<Integer,V> map, String from, String to) {
+        if(from==null && to==null)      return map;
+        if(to==null)
+            return map.headMap(Integer.parseInt(from));
+        if(from==null)
+            return map.tailMap(Integer.parseInt(to));
+
+        return map.subMap(Integer.parseInt(to),Integer.parseInt(from));
     }
 
     private static final SimpleFormatter formatter = new SimpleFormatter();
@@ -580,6 +626,10 @@ public class Functions {
         return false;
     }
 
+    public static boolean isCollapsed(String paneId) {
+    	return PaneStatusProperties.forCurrentUser().isCollapsed(paneId);
+    }
+    
     /**
      * Finds the given object in the ancestor list and returns its URL.
      * This is used to determine the "current" URL assigned to the given object,
@@ -883,7 +933,7 @@ public class Functions {
      * @since 1.494
      */
     public static Collection<Descriptor> getSortedDescriptorsForGlobalConfig(Predicate<GlobalConfigurationCategory> predicate) {
-        ExtensionList<Descriptor> exts = Jenkins.getInstance().getExtensionList(Descriptor.class);
+        ExtensionList<Descriptor> exts = ExtensionList.lookup(Descriptor.class);
         List<Tag> r = new ArrayList<Tag>(exts.size());
 
         for (ExtensionComponent<Descriptor> c : exts.getComponents()) {
@@ -999,20 +1049,15 @@ public class Functions {
 
         Item i=p;
         String url = "";
-        Collection<TopLevelItem> viewItems;
-        if (view != null) {
-            viewItems = view.getItems();
-        } else {
-            viewItems = Collections.emptyList();
-        }
         while(true) {
             ItemGroup ig = i.getParent();
             url = i.getShortUrl()+url;
 
             if(ig== Jenkins.getInstance() || (view != null && ig == view.getOwnerItemGroup())) {
                 assert i instanceof TopLevelItem;
-                if(viewItems.contains((TopLevelItem)i)) {
-                    // if p and the current page belongs to the same view, then return a relative path
+                if (view != null) {
+                    // assume p and the current page belong to the same view, so return a relative path
+                    // (even if they did not, View.getItem does not by default verify ownership)
                     return normalizeURI(ancestors.get(view)+'/'+url);
                 } else {
                     // otherwise return a path from the root Hudson
@@ -1099,7 +1144,7 @@ public class Functions {
      * @param p the Item we want the relative display name
      * @param g the ItemGroup used as point of reference for the item
      * @return
-     *      String like "foo » bar"
+     *      String like "foo/bar"
      */
     public static String getRelativeNameFrom(Item p, ItemGroup g) {
         return getRelativeNameFrom(p, g, false);
@@ -1113,7 +1158,7 @@ public class Functions {
      * @param p the Item we want the relative display name
      * @param g the ItemGroup used as point of reference for the item
      * @return
-     *      String like "foo » bar"
+     *      String like "Foo » Bar"
      */
     public static String getRelativeDisplayNameFrom(Item p, ItemGroup g) {
         return getRelativeNameFrom(p, g, true);
@@ -1125,7 +1170,6 @@ public class Functions {
         return sorted;
     }
 
-    @IgnoreJRERequirement
     public static ThreadInfo[] getThreadInfos() {
         ThreadMXBean mbean = ManagementFactory.getThreadMXBean();
         return mbean.dumpAllThreads(mbean.isObjectMonitorUsageSupported(),mbean.isSynchronizerUsageSupported());
@@ -1146,8 +1190,10 @@ public class Functions {
             while (tg.getParent() != null) tg = tg.getParent();
             Thread[] threads = new Thread[tg.activeCount()*2];
             int threadsLen = tg.enumerate(threads, true);
-            for (int i = 0; i < threadsLen; i++)
-                map.put(threads[i].getId(), threads[i].getThreadGroup().getName());
+            for (int i = 0; i < threadsLen; i++) {
+                ThreadGroup group = threads[i].getThreadGroup();
+                map.put(threads[i].getId(), group != null ? group.getName() : null);
+            }
         }
 
         protected int compare(long idA, long idB) {
@@ -1187,20 +1233,14 @@ public class Functions {
     }
 
     /**
-     * Are we running on JRE6 or above?
+     * @deprecated Now always true.
      */
-    @IgnoreJRERequirement
+    @Deprecated
     public static boolean isMustangOrAbove() {
-        try {
-            System.console();
-            return true;
-        } catch(LinkageError e) {
-            return false;
-        }
+        return true;
     }
 
     // ThreadInfo.toString() truncates the stack trace by first 8, so needed my own version
-    @IgnoreJRERequirement
     public static String dumpThreadInfo(ThreadInfo ti, ThreadGroupMap map) {
         String grp = map.getThreadGroup(ti);
         StringBuilder sb = new StringBuilder("\"" + ti.getThreadName() + "\"" +
@@ -1431,7 +1471,8 @@ public class Functions {
     }
 
     /**
-     * Returns a sub-list if the given list is bigger than the specified 'maxSize'
+     * Returns a sub-list if the given list is bigger than the specified {@code maxSize}.
+     * <strong>Warning:</strong> do not call this with a {@link RunList}, or you will break lazy loading!
      */
     public static <T> List<T> subList(List<T> base, int maxSize) {
         if(maxSize<base.size())
@@ -1533,6 +1574,7 @@ public class Functions {
      * @deprecated
      *      Use {@link #calcCheckUrl}
      */
+    @Deprecated
     public String getCheckUrl(String userDefined, Object descriptor, String field) {
         if(userDefined!=null || field==null)   return userDefined;
         if (descriptor instanceof Descriptor) {
@@ -1676,6 +1718,9 @@ public class Functions {
     public String getPasswordValue(Object o) {
         if (o==null)    return null;
         if (o instanceof Secret)    return ((Secret)o).getEncryptedValue();
+        if (getIsUnitTest()) {
+            throw new SecurityException("attempted to render plaintext ‘" + o + "’ in password field; use a getter of type Secret instead");
+        }
         return o.toString();
     }
 
@@ -1780,6 +1825,7 @@ public class Functions {
      * @deprecated as of 1.451
      *      Use {@link #getAvatar}
      */
+    @Deprecated
     public String getUserAvatar(User user, String avatarSize) {
         return getAvatar(user,avatarSize);
     }
@@ -1823,9 +1869,11 @@ public class Functions {
      * @since 1.517
      */
     public static String breakableString(final String plain) {
-
-        return plain.replaceAll("(\\p{Punct}+\\w)", "<wbr>$1")
-                .replaceAll("(\\w{10})(?=\\w{3})", "$1<wbr>")
+        if (plain == null) {
+            return null;
+        }
+        return plain.replaceAll("([\\p{Punct}&&[^;]]+\\w)", "<wbr>$1")
+                .replaceAll("([^\\p{Punct}\\s-]{20})(?=[^\\p{Punct}\\s-]{10})", "$1<wbr>")
         ;
     }
 
@@ -1835,17 +1883,29 @@ public class Functions {
      */
     public static void advertiseHeaders(HttpServletResponse rsp) {
         Jenkins j = Jenkins.getInstance();
+        if (j!=null) {
+            rsp.setHeader("X-Hudson","1.395");
+            rsp.setHeader("X-Jenkins", Jenkins.VERSION);
+            rsp.setHeader("X-Jenkins-Session", Jenkins.SESSION_HASH);
 
-        rsp.setHeader("X-Hudson","1.395");
-        rsp.setHeader("X-Jenkins", Jenkins.VERSION);
-        rsp.setHeader("X-Jenkins-Session", Jenkins.SESSION_HASH);
-
-        TcpSlaveAgentListener tal = j.tcpSlaveAgentListener;
-        if (tal !=null) {
-            rsp.setIntHeader("X-Hudson-CLI-Port", tal.getPort());
-            rsp.setIntHeader("X-Jenkins-CLI-Port", tal.getPort());
-            rsp.setIntHeader("X-Jenkins-CLI2-Port", tal.getPort());
-            rsp.setHeader("X-Jenkins-CLI-Host", TcpSlaveAgentListener.CLI_HOST_NAME);
+            TcpSlaveAgentListener tal = j.tcpSlaveAgentListener;
+            if (tal !=null) {
+                int p = TcpSlaveAgentListener.CLI_PORT !=null ? TcpSlaveAgentListener.CLI_PORT : tal.getPort();
+                rsp.setIntHeader("X-Hudson-CLI-Port", p);
+                rsp.setIntHeader("X-Jenkins-CLI-Port", p);
+                rsp.setIntHeader("X-Jenkins-CLI2-Port", p);
+                rsp.setHeader("X-Jenkins-CLI-Host", TcpSlaveAgentListener.CLI_HOST_NAME);
+            }
         }
     }
+
+    @Restricted(NoExternalUse.class) // for actions.jelly and ContextMenu.add
+    public static boolean isContextMenuVisible(Action a) {
+        if (a instanceof ModelObjectWithContextMenu.ContextMenuVisibility) {
+            return ((ModelObjectWithContextMenu.ContextMenuVisibility) a).isVisible();
+        } else {
+            return true;
+        }
+    }
+
 }

@@ -26,18 +26,25 @@ package jenkins.util;
 
 import hudson.FilePath;
 import hudson.model.DirectoryBrowserSupport;
+import hudson.remoting.Callable;
 import hudson.remoting.Channel;
 import hudson.remoting.VirtualChannel;
 import hudson.util.DirScanner;
 import hudson.util.FileVisitor;
 import java.io.File;
 import java.io.FileInputStream;
+import java.io.FileNotFoundException;
 import java.io.IOException;
 import java.io.InputStream;
+import java.io.Serializable;
 import java.net.URI;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.logging.Level;
+import java.util.logging.Logger;
 import javax.annotation.Nonnull;
+
+import jenkins.MasterToSlaveFileCallable;
 
 /**
  * Abstraction over {@link File}, {@link FilePath}, or other items such as network resources or ZIP entries.
@@ -56,7 +63,7 @@ import javax.annotation.Nonnull;
  * @see FilePath
  * @since 1.532
  */
-public abstract class VirtualFile implements Comparable<VirtualFile> {
+public abstract class VirtualFile implements Comparable<VirtualFile>, Serializable {
     
     /**
      * Gets the base name, meaning just the last portion of the path name without any
@@ -185,12 +192,35 @@ public abstract class VirtualFile implements Comparable<VirtualFile> {
     }
 
     /**
+     * Does some calculations in batch.
+     * For a remote file, this can be much faster than doing the corresponding operations one by one as separate requests.
+     * The default implementation just calls the block directly.
+     * @param <V> a value type
+     * @param <T> the exception type
+     * @param callable something to run all at once (only helpful if any mentioned files are on the same system)
+     * @return the callable result
+     * @throws IOException if remote communication failed
+     * @since 1.554
+     */
+    public <V> V run(Callable<V,IOException> callable) throws IOException {
+        return callable.call();
+    }
+
+    /**
      * Creates a virtual file wrapper for a local file.
      * @param f a disk file (need not exist)
      * @return a wrapper
      */
     public static VirtualFile forFile(final File f) {
-        return new VirtualFile() {
+        return new FileVF(f, f);
+    }
+    private static final class FileVF extends VirtualFile {
+        private final File f;
+        private final File root;
+        FileVF(File f, File root) {
+            this.f = f;
+            this.root = root;
+        }
             @Override public String getName() {
                 return f.getName();
             }
@@ -198,47 +228,85 @@ public abstract class VirtualFile implements Comparable<VirtualFile> {
                 return f.toURI();
             }
             @Override public VirtualFile getParent() {
-                return forFile(f.getParentFile());
+                return new FileVF(f.getParentFile(), root);
             }
             @Override public boolean isDirectory() throws IOException {
+                if (isIllegalSymlink()) {
+                    return false;
+                }
                 return f.isDirectory();
             }
             @Override public boolean isFile() throws IOException {
+                if (isIllegalSymlink()) {
+                    return false;
+                }
                 return f.isFile();
             }
             @Override public boolean exists() throws IOException {
+                if (isIllegalSymlink()) {
+                    return false;
+                }
                 return f.exists();
             }
             @Override public VirtualFile[] list() throws IOException {
+                if (isIllegalSymlink()) {
+                    return new VirtualFile[0];
+                }
                 File[] kids = f.listFiles();
                 if (kids == null) {
                     return new VirtualFile[0];
                 }
                 VirtualFile[] vfs = new VirtualFile[kids.length];
                 for (int i = 0; i < kids.length; i++) {
-                    vfs[i] = forFile(kids[i]);
+                    vfs[i] = new FileVF(kids[i], root);
                 }
                 return vfs;
             }
             @Override public String[] list(String glob) throws IOException {
+                if (isIllegalSymlink()) {
+                    return new String[0];
+                }
                 return new Scanner(glob).invoke(f, null);
             }
             @Override public VirtualFile child(String name) {
-                return forFile(new File(f, name));
+                return new FileVF(new File(f, name), root);
             }
             @Override public long length() throws IOException {
+                if (isIllegalSymlink()) {
+                    return 0;
+                }
                 return f.length();
             }
             @Override public long lastModified() throws IOException {
+                if (isIllegalSymlink()) {
+                    return 0;
+                }
                 return f.lastModified();
             }
             @Override public boolean canRead() throws IOException {
+                if (isIllegalSymlink()) {
+                    return false;
+                }
                 return f.canRead();
             }
             @Override public InputStream open() throws IOException {
+                if (isIllegalSymlink()) {
+                    throw new FileNotFoundException(f.getPath());
+                }
                 return new FileInputStream(f);
             }
-        };
+        private boolean isIllegalSymlink() { // TODO JENKINS-26838
+            try {
+                String myPath = f.getCanonicalPath();
+                String rootPath = root.getCanonicalPath();
+                if (!myPath.equals(rootPath) && !myPath.startsWith(rootPath + File.separatorChar)) {
+                    return true;
+                }
+            } catch (IOException x) {
+                Logger.getLogger(VirtualFile.class.getName()).log(Level.FINE, "could not determine symlink status of " + f, x);
+            }
+            return false;
+        }
     }
 
     /**
@@ -247,7 +315,13 @@ public abstract class VirtualFile implements Comparable<VirtualFile> {
      * @return a wrapper
      */
     public static VirtualFile forFilePath(final FilePath f) {
-        return new VirtualFile() {
+        return new FilePathVF(f);
+    }
+    private static final class FilePathVF extends VirtualFile {
+        private final FilePath f;
+        FilePathVF(FilePath f) {
+            this.f = f;
+        }
             @Override public String getName() {
                 return f.getName();
             }
@@ -326,11 +400,21 @@ public abstract class VirtualFile implements Comparable<VirtualFile> {
                 }
             }
             @Override public InputStream open() throws IOException {
-                return f.read();
+                try {
+                    return f.read();
+                } catch (InterruptedException x) {
+                    throw (IOException) new IOException(x.toString()).initCause(x);
+                }
             }
-        };
+            @Override public <V> V run(Callable<V,IOException> callable) throws IOException {
+                try {
+                    return f.act(callable);
+                } catch (InterruptedException x) {
+                    throw (IOException) new IOException(x.toString()).initCause(x);
+                }
+            }
     }
-    private static final class Scanner implements FilePath.FileCallable<String[]> {
+    private static final class Scanner extends MasterToSlaveFileCallable<String[]> {
         private final String glob;
         Scanner(String glob) {
             this.glob = glob;
@@ -347,7 +431,7 @@ public abstract class VirtualFile implements Comparable<VirtualFile> {
         }
 
     }
-    private static final class Readable implements FilePath.FileCallable<Boolean> {
+    private static final class Readable extends MasterToSlaveFileCallable<Boolean> {
         @Override public Boolean invoke(File f, VirtualChannel channel) throws IOException, InterruptedException {
             return f.canRead();
         }

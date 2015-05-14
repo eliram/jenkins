@@ -27,6 +27,7 @@ package org.jvnet.hudson.test;
 import com.gargoylesoftware.htmlunit.AlertHandler;
 import com.gargoylesoftware.htmlunit.html.HtmlImage;
 import com.google.inject.Injector;
+
 import hudson.ClassicPluginStrategy;
 import hudson.CloseProofOutputStream;
 import hudson.DNSMultiCast;
@@ -100,6 +101,7 @@ import java.net.MalformedURLException;
 import java.net.URISyntaxException;
 import java.net.URL;
 import java.net.URLClassLoader;
+import java.net.URLConnection;
 import java.nio.charset.Charset;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -183,7 +185,9 @@ import com.gargoylesoftware.htmlunit.html.HtmlPage;
 import com.gargoylesoftware.htmlunit.javascript.HtmlUnitContextFactory;
 import com.gargoylesoftware.htmlunit.javascript.host.xml.XMLHttpRequest;
 import com.gargoylesoftware.htmlunit.xml.XmlPage;
+
 import java.net.HttpURLConnection;
+
 import jenkins.model.JenkinsLocationConfiguration;
 
 /**
@@ -255,7 +259,7 @@ public abstract class HudsonTestCase extends TestCase implements RootAction {
     /**
      * Number of seconds until the test times out.
      */
-    public int timeout = 180;
+    public int timeout = Integer.getInteger("jenkins.test.timeout", 180);
 
     private volatile Timer timeoutTimer;
 
@@ -272,6 +276,8 @@ public abstract class HudsonTestCase extends TestCase implements RootAction {
      * The directory where a war file gets exploded.
      */
     protected File explodedWarDir;
+
+    private boolean origDefaultUseCache = true;
 
     protected HudsonTestCase(String name) {
         super(name);
@@ -295,6 +301,18 @@ public abstract class HudsonTestCase extends TestCase implements RootAction {
 
     @Override
     protected void  setUp() throws Exception {
+        if(Functions.isWindows()) {
+            // JENKINS-4409.
+            // URLConnection caches handles to jar files by default,
+            // and it prevents delete temporary directories on Windows.
+            // Disables caching here.
+            // Though defaultUseCache is a static field,
+            // its setter and getter are provided as instance methods.
+            URLConnection aConnection = new File(".").toURI().toURL().openConnection();
+            origDefaultUseCache = aConnection.getDefaultUseCaches();
+            aConnection.setDefaultUseCaches(false);
+        }
+        
         env.pin();
         recipe();
         for (Runner r : recipes) {
@@ -355,8 +373,10 @@ public abstract class HudsonTestCase extends TestCase implements RootAction {
         timeoutTimer.schedule(new TimerTask() {
             @Override
             public void run() {
-                if (timeoutTimer!=null)
+                if (timeoutTimer!=null) {
+                    LOGGER.warning(String.format("Test timed out (after %d seconds).", timeout));
                     testThread.interrupt();
+                }
             }
         }, TimeUnit.SECONDS.toMillis(timeout));
     }
@@ -406,15 +426,26 @@ public abstract class HudsonTestCase extends TestCase implements RootAction {
 
             if (jenkins!=null)
                 jenkins.cleanUp();
-            env.dispose();
             ExtensionList.clearLegacyInstances();
             DescriptorExtensionList.clearLegacyInstances();
+
+            try {
+                env.dispose();
+            } catch (Exception x) {
+                x.printStackTrace();
+            }
 
             // Jenkins creates ClassLoaders for plugins that hold on to file descriptors of its jar files,
             // but because there's no explicit dispose method on ClassLoader, they won't get GC-ed until
             // at some later point, leading to possible file descriptor overflow. So encourage GC now.
             // see http://bugs.sun.com/view_bug.do?bug_id=4950148
             System.gc();
+            
+            // restore defaultUseCache
+            if(Functions.isWindows()) {
+                URLConnection aConnection = new File(".").toURI().toURL().openConnection();
+                aConnection.setDefaultUseCaches(origDefaultUseCache);
+            }
         }
     }
 
@@ -1810,7 +1841,16 @@ public abstract class HudsonTestCase extends TestCase implements RootAction {
         }
 
         public Page goTo(String relative, String expectedContentType) throws IOException, SAXException {
-            Page p = super.getPage(getContextPath() + relative);
+            while (relative.startsWith("/")) relative = relative.substring(1);
+            Page p;
+            try {
+                p = super.getPage(getContextPath() + relative);
+            } catch (IOException x) {
+                if (x.getCause() != null) {
+                    x.getCause().printStackTrace();
+                }
+                throw x;
+            }
             assertEquals(expectedContentType,p.getWebResponse().getContentType());
             return p;
         }

@@ -6,6 +6,7 @@ import hudson.ExtensionPoint;
 import jenkins.model.Jenkins;
 import java.util.Collection;
 import java.util.Collections;
+import jenkins.model.TransientActionFactory;
 
 /**
  * Extension point for inserting transient {@link Action}s into {@link Run}s.
@@ -15,8 +16,9 @@ import java.util.Collections;
  * @author Lucie Votypkova
  * @since 1.458
  * @see Action
+ * @deprecated Does not contribute to {@link Run#getActions}. Use {@link TransientActionFactory} instead.
  */
-
+@Deprecated
 public abstract class TransientBuildActionFactory implements ExtensionPoint {
     /**
      * Creates actions for the given build.
@@ -35,6 +37,7 @@ public abstract class TransientBuildActionFactory implements ExtensionPoint {
      * @deprecated as of 1.461
      *      Override and call {@link #createFor(Run)} instead.
      */
+    @Deprecated
     public Collection<? extends Action> createFor(AbstractBuild target) {
         return Collections.emptyList();
     }
@@ -43,6 +46,6 @@ public abstract class TransientBuildActionFactory implements ExtensionPoint {
      * Returns all the registered {@link TransientBuildActionFactory}s.
      */
     public static ExtensionList<TransientBuildActionFactory> all() {
-        return Jenkins.getInstance().getExtensionList(TransientBuildActionFactory.class);
+        return ExtensionList.lookup(TransientBuildActionFactory.class);
     }
 }
